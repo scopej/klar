@@ -34,6 +34,8 @@ type Image struct {
 	client        http.Client
 	digest        string
 	schemaVersion int
+	os            string
+	arch          string
 }
 
 func (i *Image) LayerName(index int) string {
@@ -87,6 +89,27 @@ type layer struct {
 	Digest string
 }
 
+// ManifestList represents a ManifestList V 2
+type manifestList struct {
+	SchemaVersion int
+	MediaType     string
+	Manifests     []manifest
+}
+
+// Manifest represents a manifest item in a ManifestList V 2
+type manifest struct {
+	MediaType string
+	Size      int
+	Digest    string
+	Platform  platform
+}
+
+type platform struct {
+	Architecture string
+	OS           string
+	Variant      string
+}
+
 type Config struct {
 	ImageName        string
 	User             string
@@ -95,6 +118,8 @@ type Config struct {
 	InsecureTLS      bool
 	InsecureRegistry bool
 	Timeout          time.Duration
+	PlatformOS       string
+	PlatformArch     string
 }
 
 const dockerHub = "registry-1.docker.io"
@@ -116,6 +141,8 @@ func NewImage(conf *Config) (*Image, error) {
 	registry := dockerHub
 	tag := "latest"
 	token := ""
+	os := "linux"
+	arch := "amd64"
 	var nameParts, tagParts []string
 	var name, port string
 	state := stateInitial
@@ -183,6 +210,12 @@ func NewImage(conf *Config) (*Image, error) {
 	if conf.Token != "" {
 		token = "Basic " + conf.Token
 	}
+	if conf.PlatformOS != "" {
+		os = conf.PlatformOS
+	}
+	if conf.PlatformArch != "" {
+		arch = conf.PlatformArch
+	}
 
 	return &Image{
 		Registry: registry,
@@ -192,6 +225,8 @@ func NewImage(conf *Config) (*Image, error) {
 		password: conf.Password,
 		Token:    token,
 		client:   client,
+		os:       os,
+		arch:     arch,
 	}, nil
 }
 
@@ -204,10 +239,8 @@ func (i *Image) Pull() error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		if i.Token == "" {
-			i.Token, err = i.requestToken(resp)
-			io.Copy(ioutil.Discard, resp.Body)
-		}
+		i.Token, err = i.requestToken(resp)
+		io.Copy(ioutil.Discard, resp.Body)
 		if err != nil {
 			return err
 		}
@@ -217,27 +250,25 @@ func (i *Image) Pull() error {
 			return err
 		}
 		defer resp.Body.Close()
-		// try one more time by clearing the token to request it
-		if resp.StatusCode == http.StatusUnauthorized {
-			i.Token, err = i.requestToken(resp)
-			io.Copy(ioutil.Discard, resp.Body)
-			if err != nil {
-				return err
-			}
-			// try again
-			resp, err = i.pullReq()
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType == "application/vnd.docker.distribution.manifest.list.v2+json" {
+		err = parseManifestResponse(resp, i)
+		if err != nil {
+			return err
 		}
+		// pull actual manifest instead of manifestlist
+		resp, err = i.pullReq()
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
 	}
 	return parseImageResponse(resp, i)
 }
 
 func parseImageResponse(resp *http.Response, image *Image) error {
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "application/vnd.docker.distribution.manifest.v2+json" {
+	switch contentType := resp.Header.Get("Content-Type"); contentType {
+	case "application/vnd.docker.distribution.manifest.v2+json":
 		var imageV2 imageV2
 		if err := json.NewDecoder(resp.Body).Decode(&imageV2); err != nil {
 			fmt.Fprintln(os.Stderr, "Image V2 decode error")
@@ -249,7 +280,7 @@ func parseImageResponse(resp *http.Response, image *Image) error {
 		}
 		image.digest = imageV2.Config.Digest
 		image.schemaVersion = imageV2.SchemaVersion
-	} else {
+	case "application/vnd.docker.distribution.manifest.v1+prettyjws":
 		var imageV1 imageV1
 		if err := json.NewDecoder(resp.Body).Decode(&imageV1); err != nil {
 			fmt.Fprintln(os.Stderr, "ImageV1 decode error")
@@ -262,8 +293,25 @@ func parseImageResponse(resp *http.Response, image *Image) error {
 			image.FsLayers[len(imageV1.FsLayers)-1-i].BlobSum = imageV1.FsLayers[i].BlobSum
 		}
 		image.schemaVersion = imageV1.SchemaVersion
+	default:
+		return fmt.Errorf("Docker Registry responded with unsupported Content-Type: %s", contentType)
 	}
 	return nil
+}
+
+func parseManifestResponse(resp *http.Response, image *Image) error {
+	var manifestlist manifestList
+	if err := json.NewDecoder(resp.Body).Decode(&manifestlist); err != nil {
+		fmt.Fprintln(os.Stderr, "ManifestList decode error")
+		return err
+	}
+	for _, m := range manifestlist.Manifests {
+		if m.Platform.OS == image.os && m.Platform.Architecture == image.arch {
+			image.Tag = m.Digest
+			return nil
+		}
+	}
+	return fmt.Errorf("Did not find the specified platform (os: %s, arch: %s) in the manifest list.", image.os, image.arch)
 }
 
 func (i *Image) requestToken(resp *http.Response) (string, error) {
@@ -292,7 +340,9 @@ func (i *Image) requestToken(resp *http.Response) (string, error) {
 	}
 	tResp, err := i.client.Do(req)
 	if err != nil {
-		io.Copy(ioutil.Discard, tResp.Body)
+		if tResp != nil {
+			io.Copy(ioutil.Discard, tResp.Body)
+		}
 		return "", err
 	}
 
@@ -319,17 +369,15 @@ func (i *Image) pullReq() (*http.Response, error) {
 		fmt.Fprintln(os.Stderr, "Can't create a request")
 		return nil, err
 	}
-	if i.Token == "" {
-		if i.user != "" {
-			req.SetBasicAuth(i.user, i.password)
-			i.Token = req.Header.Get("Authorization")
-		}
+	if i.Token == "" && i.user != "" {
+		req.SetBasicAuth(i.user, i.password)
+		i.Token = req.Header.Get("Authorization")
 	} else {
 		req.Header.Set("Authorization", i.Token)
 	}
 
 	// Prefer manifest schema v2
-	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.v1+prettyjws")
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.v1+prettyjws, application/vnd.docker.distribution.manifest.list.v2+json")
 	utils.DumpRequest(req)
 	resp, err := i.client.Do(req)
 	if err != nil {
